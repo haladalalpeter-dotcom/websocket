@@ -1,119 +1,108 @@
-import express from "express";
-import http from "http";
-import cors from "cors";
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
-import { WebSocketServer } from "ws";
+import express from 'express';
+import { WebSocketServer } from 'ws';
+import cors from 'cors';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const DATA_FILE = path.join(__dirname, "data.json");
-
 const app = express();
-app.use(cors());
-app.use(express.json());
+const PORT = process.env.PORT || 3000;
+const COUNTERS_FILE = path.join(__dirname, 'counters.json');
 
-// ===== تحميل البيانات =====
+// Use CORS
+app.use(cors());
+
+// Load counters from file
 let counters = {};
 try {
-  if (fs.existsSync(DATA_FILE)) {
-    counters = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-  }
-} catch (e) {
-  console.error("❌ Failed to load data.json");
-  counters = {};
+  const data = fs.readFileSync(COUNTERS_FILE, 'utf8');
+  counters = JSON.parse(data);
+} catch (err) {
+  console.log('No existing counters file, starting fresh');
 }
 
-// ===== حفظ البيانات =====
-function saveData() {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(counters, null, 2));
+// Save counters to file
+function saveCounters() {
+  fs.writeFileSync(COUNTERS_FILE, JSON.stringify(counters, null, 2));
 }
 
-// health check
-app.get("/", (req, res) => {
-  res.send("WS OK");
+// Map of userId to Set of WebSocket connections
+const connections = new Map();
+
+// Create WebSocket server
+const server = app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
 
-const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// WebSocket connections لكل مستخدم
-const userConnections = {};
+// WebSocket connection handler
+wss.on('connection', (ws) => {
+  let userId = null;
 
-// ===== WebSocket =====
-wss.on("connection", (ws) => {
-  console.log("🟢 client connected");
-
-  ws.on("message", (msg) => {
-    let data;
+  ws.on('message', (data) => {
     try {
-      data = JSON.parse(msg.toString());
-    } catch {
-      return;
-    }
-
-    if (data.type === "register" && data.userId) {
-      const userId = String(data.userId);
-      ws.userId = userId;
-
-      if (!userConnections[userId]) {
-        userConnections[userId] = [];
+      const message = JSON.parse(data.toString());
+      if (message.type === 'register' && message.userId) {
+        userId = message.userId;
+        // Initialize counter if not exists
+        if (!(userId in counters)) {
+          counters[userId] = 0;
+        }
+        // Add connection to the set
+        if (!connections.has(userId)) {
+          connections.set(userId, new Set());
+        }
+        connections.get(userId).add(ws);
+        // Send current counter
+        ws.send(JSON.stringify({ type: 'update', counter: counters[userId] }));
       }
-      userConnections[userId].push(ws);
-
-      ws.send(JSON.stringify({
-        type: "count",
-        value: counters[userId] || 0
-      }));
+    } catch (err) {
+      console.error('Invalid message:', err);
     }
   });
 
-  ws.on("close", () => {
-    if (ws.userId && userConnections[ws.userId]) {
-      userConnections[ws.userId] =
-        userConnections[ws.userId].filter(c => c !== ws);
-
-      if (userConnections[ws.userId].length === 0) {
-        delete userConnections[ws.userId];
+  ws.on('close', () => {
+    if (userId && connections.has(userId)) {
+      connections.get(userId).delete(ws);
+      // Clean up if no connections left
+      if (connections.get(userId).size === 0) {
+        connections.delete(userId);
       }
     }
   });
 });
 
-// ===== HTTP increment =====
-app.get("/open", (req, res) => {
+// HTTP endpoint to increment counter
+app.get('/open', (req, res) => {
   const userId = req.query.id;
   if (!userId) {
-    return res.status(400).json({ error: "missing id" });
+    return res.status(400).json({ error: 'Missing userId' });
   }
 
-  const uid = String(userId);
+  // Initialize if not exists
+  if (!(userId in counters)) {
+    counters[userId] = 0;
+  }
 
-  if (!counters[uid]) counters[uid] = 0;
-  counters[uid]++;
+  // Increment
+  counters[userId] += 1;
 
-  // حفظ دائم
-  saveData();
+  // Save to file
+  saveCounters();
 
-  // بث التحديث
-  if (userConnections[uid]) {
-    userConnections[uid].forEach(ws => {
+  // Broadcast update to all connections for this userId
+  if (connections.has(userId)) {
+    const message = JSON.stringify({ type: 'update', counter: counters[userId] });
+    connections.get(userId).forEach((ws) => {
       if (ws.readyState === ws.OPEN) {
-        ws.send(JSON.stringify({
-          type: "count",
-          value: counters[uid]
-        }));
+        ws.send(message);
       }
     });
   }
 
-  res.json({ ok: true, count: counters[uid] });
-});
-
-// ===== PORT =====
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log("🚀 running on port", PORT);
+  res.json({ success: true, counter: counters[userId] });
 });
