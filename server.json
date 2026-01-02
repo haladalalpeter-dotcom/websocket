@@ -1,7 +1,7 @@
 import express from 'express';
 import { WebSocketServer } from 'ws';
 import cors from 'cors';
-import fs from 'fs';
+import Database from 'better-sqlite3';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -10,24 +10,28 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const COUNTERS_FILE = path.join(__dirname, 'counters.json');
+const DB_PATH = path.join(__dirname, 'counters.db');
 
 // Use CORS
 app.use(cors());
 
-// Load counters from file
-let counters = {};
-try {
-  const data = fs.readFileSync(COUNTERS_FILE, 'utf8');
-  counters = JSON.parse(data);
-} catch (err) {
-  console.log('No existing counters file, starting fresh');
-}
+// Initialize SQLite database
+const db = new Database(DB_PATH);
 
-// Save counters to file
-function saveCounters() {
-  fs.writeFileSync(COUNTERS_FILE, JSON.stringify(counters, null, 2));
-}
+// Create table if not exists
+db.exec(`
+  CREATE TABLE IF NOT EXISTS counters (
+    userId TEXT PRIMARY KEY,
+    counter INTEGER DEFAULT 0
+  )
+`);
+
+// Prepare statements
+const getCounterStmt = db.prepare('SELECT counter FROM counters WHERE userId = ?');
+const upsertCounterStmt = db.prepare(`
+  INSERT INTO counters (userId, counter) VALUES (?, ?)
+  ON CONFLICT(userId) DO UPDATE SET counter = excluded.counter
+`);
 
 // Map of userId to Set of WebSocket connections
 const connections = new Map();
@@ -48,9 +52,11 @@ wss.on('connection', (ws) => {
       const message = JSON.parse(data.toString());
       if (message.type === 'register' && message.userId) {
         userId = message.userId;
-        // Initialize counter if not exists
-        if (!(userId in counters)) {
-          counters[userId] = 0;
+        // Get current counter from DB
+        let counter = 0;
+        const row = getCounterStmt.get(userId);
+        if (row) {
+          counter = row.counter;
         }
         // Add connection to the set
         if (!connections.has(userId)) {
@@ -58,7 +64,7 @@ wss.on('connection', (ws) => {
         }
         connections.get(userId).add(ws);
         // Send current counter
-        ws.send(JSON.stringify({ type: 'update', counter: counters[userId] }));
+        ws.send(JSON.stringify({ type: 'update', counter }));
       }
     } catch (err) {
       console.error('Invalid message:', err);
@@ -83,20 +89,22 @@ app.get('/open', (req, res) => {
     return res.status(400).json({ error: 'Missing userId' });
   }
 
-  // Initialize if not exists
-  if (!(userId in counters)) {
-    counters[userId] = 0;
+  // Get current counter
+  let counter = 0;
+  const row = getCounterStmt.get(userId);
+  if (row) {
+    counter = row.counter;
   }
 
   // Increment
-  counters[userId] += 1;
+  counter += 1;
 
-  // Save to file
-  saveCounters();
+  // Save to DB
+  upsertCounterStmt.run(userId, counter);
 
   // Broadcast update to all connections for this userId
   if (connections.has(userId)) {
-    const message = JSON.stringify({ type: 'update', counter: counters[userId] });
+    const message = JSON.stringify({ type: 'update', counter });
     connections.get(userId).forEach((ws) => {
       if (ws.readyState === ws.OPEN) {
         ws.send(message);
@@ -104,5 +112,5 @@ app.get('/open', (req, res) => {
     });
   }
 
-  res.json({ success: true, counter: counters[userId] });
+  res.json({ success: true, counter });
 });
